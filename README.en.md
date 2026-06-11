@@ -145,8 +145,8 @@ Parts of Wave Tools were integrated, adapted, and modified from the following pu
 - [mmaiergerber/wk_spectra](https://github.com/mmaiergerber/wk_spectra)
 - brianpm: [wavenumber_frequency_functions.py](https://github.com/Blissful-Jasper/wavenumber_frequency/blob/master/wavenumber_frequency_functions.py)
 - Alejandro Jaramillo: [wk_analysis.py](https://github.com/Blissful-Jasper/wk_spectra/blob/master/wk_spectra/wk_analysis.py)
-- tmiyachi: [spectrum.py](https://github.com/Blissful-Jasper/mcclimate/blob/master/spectrum.py)
 - muting-chien: [CCKW_aquaplanet/function](https://github.com/muting-chien/CCKW_aquaplanet/tree/ef3a5ea0f1166a831aa69b6834db3f52e0aa0c19/function)
+- tmiyachi:[mcclimate](https://github.com/tmiyachi/mcclimate)
 
 ## Citation
 
