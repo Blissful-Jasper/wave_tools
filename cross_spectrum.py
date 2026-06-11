@@ -96,7 +96,7 @@ def nan_to_value_by_interp_3D(V: np.ndarray) -> np.ndarray:
 def remove_annual_cycle(
     data: Union[xr.DataArray, np.ndarray],
     spd: int = 1,
-    fCrit: float = 1.0/365.0
+    # fCrit: float = 1.0/365.0
 ) -> Union[xr.DataArray, np.ndarray]:
     """
     去除数据的年循环和趋势
@@ -134,10 +134,10 @@ def remove_annual_cycle(
     # 步骤2: FFT并去除低频成分
     rf = fft.rfft(detrend, axis=0)
     freq = fft.rfftfreq(ntim, d=1.0 / float(spd))
-    fcrit_ndx = np.argwhere(freq <= fCrit).max()
-    
-    if fcrit_ndx > 1:
-        rf[1:fcrit_ndx+1, ...] = 0.0
+    harmonics = [1/365.0, 2/365.0, 3/365.0]
+    for hf in harmonics:
+        idx = np.argmin(np.abs(freq - hf))
+        rf[idx, ...] = 0.0
     
     # 逆FFT
     datain = fft.irfft(rf, axis=0, n=ntim)

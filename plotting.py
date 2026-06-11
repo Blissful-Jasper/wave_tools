@@ -21,6 +21,7 @@ from matplotlib import gridspec
 from typing import Optional, List, Tuple
 import xarray as xr
 import os
+import warnings
 from wave_tools import matsuno as mp
 try:
     import cartopy.crs as ccrs
@@ -32,9 +33,26 @@ except ImportError:
 
 try:
     import cmaps
-    DEFAULT_CMAP = cmaps.amwg_blueyellowred
+    DEFAULT_CMAP = getattr(cmaps, 'cmocean_balance', getattr(cmaps, 'NCV_blu_red', 'RdBu_r'))
 except ImportError:
     DEFAULT_CMAP = 'RdBu_r'
+
+
+def _show_figure(fig) -> None:
+    """Show a figure when the active backend supports it."""
+    backend = plt.get_backend().lower()
+    if "agg" not in backend or "inline" in backend:
+        plt.show()
+        return
+
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+    except ImportError:
+        return
+
+    if get_ipython() is not None:
+        display(fig)
 
 
 # ==================== CCKW包络绘图 ====================
@@ -136,11 +154,44 @@ def plot_cckw_envelope(he: Optional[List[float]] = None,
         fig.savefig(f"{save_path}.pdf", dpi=dpi, bbox_inches='tight')
         print(f'保存至: {save_path}.pdf')
     
-    plt.show()
+    _show_figure(fig)
     plt.close()
 
 
 # ==================== Wheeler-Kiladis频谱绘图 ====================
+
+def _plot_matsuno_mode_lines(ax,
+                             matsuno_modes,
+                             families: List[str],
+                             max_freq: float,
+                             line_color: str = 'k') -> None:
+    """绘制指定波族的Matsuno频散曲线。"""
+    family_columns = {
+        "Kelvin": "Kelvin(he={depth}m)",
+        "ER n=1": "ER(n=1,he={depth}m)",
+        "MRG": "MRG(he={depth}m)",
+        "EIG n=0": "EIG(n=0,he={depth}m)",
+        "EIG n=1": "EIG(n=1,he={depth}m)",
+        "WIG n=1": "WIG(n=1,he={depth}m)",
+    }
+
+    for family in families:
+        column_template = family_columns.get(family)
+        if column_template is None:
+            continue
+
+        for depth, frame in matsuno_modes.items():
+            column = column_template.format(depth=depth)
+            if column not in frame:
+                continue
+
+            series = frame[column].astype(float)
+            x_values = series.index.values
+            y_values = series.values
+            valid = np.isfinite(y_values) & (y_values >= 0.0) & (y_values <= max_freq)
+            if np.any(valid):
+                ax.plot(x_values[valid], y_values[valid],
+                        color=line_color, linestyle='-', linewidth=0.8)
 
 def plot_wk_spectrum(power_symmetric: xr.DataArray,
                      power_antisymmetric: xr.DataArray,
@@ -154,7 +205,9 @@ def plot_wk_spectrum(power_symmetric: xr.DataArray,
                      cpd_lines: List[float] = [3, 6, 30],
                      save_path: Optional[str] = None,
                      cmap: str = 'RdBu_r',
-                     levels: Optional[np.ndarray] = None) -> None:
+                     levels: Optional[np.ndarray] = None,
+                     show: bool = True,
+                     close: bool = False):
     """
     绘制Wheeler-Kiladis频谱图（对称和反对称分量）
     
@@ -186,6 +239,15 @@ def plot_wk_spectrum(power_symmetric: xr.DataArray,
         色标
     levels : np.ndarray, optional
         等值线水平
+    show : bool
+        是否调用plt.show()
+    close : bool
+        是否在绘图/保存后关闭figure，批量绘图时建议设为True
+
+    返回:
+    ----
+    fig, axes
+        Matplotlib图形和坐标轴对象
     """
     if levels is None:
         levels = np.array([1, 1.2, 1.4, 1.6, 1.8, 2.0])
@@ -198,7 +260,12 @@ def plot_wk_spectrum(power_symmetric: xr.DataArray,
     sym_plot = sym_norm.sel(frequency=slice(0, max_freq), wavenumber=slice(-max_wn, max_wn))
     asym_plot = asym_norm.sel(frequency=slice(0, max_freq), wavenumber=slice(-max_wn, max_wn))
     
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=200)
+    fig = plt.figure(figsize=(12, 6.2), dpi=200)
+    gs = fig.add_gridspec(3, 2, height_ratios=[1, 0.08, 0.1], hspace=0.1, wspace=0.25)
+    axes = np.array([
+        fig.add_subplot(gs[0, 0]),
+        fig.add_subplot(gs[0, 1]),
+    ])
     
     # 对称分量
     im1 = sym_plot.plot.contourf(ax=axes[0], cmap=cmap, levels=levels, 
@@ -231,32 +298,48 @@ def plot_wk_spectrum(power_symmetric: xr.DataArray,
     
     # 添加Matsuno理论曲线
     if add_matsuno_lines:
-        from .matsuno import matsuno_modes_wk
-        matsuno_modes = matsuno_modes_wk(he=he, n=[1], max_wn=max_wn)
+        try:
+            from .matsuno import matsuno_modes_wk
+        except ImportError:
+            from wave_tools.matsuno import matsuno_modes_wk
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The iteration is not making good progress")
+            matsuno_modes = matsuno_modes_wk(he=he, n=[1], max_wn=max_wn)
         
         kw_x, kw_y = get_cckw_envelope_curve()
-        
-        for ax in axes:
-            for key in matsuno_modes:
-                ax.plot(matsuno_modes[key]['Kelvin(he={}m)'.format(key)], 
-                       color='k', linestyle='-', linewidth=0.8)
-                ax.plot(matsuno_modes[key]['ER(n=1,he={}m)'.format(key)],
-                       color='k', linestyle='-', linewidth=0.8)
-            
-            ax.plot(kw_x[0], kw_y[0], 'g', linewidth=1.2, linestyle='-', zorder=5)
+
+        _plot_matsuno_mode_lines(
+            axes[0], matsuno_modes, families=["Kelvin", "ER n=1"], max_freq=max_freq
+        )
+        _plot_matsuno_mode_lines(
+            axes[1], matsuno_modes, families=["MRG", "EIG n=0"], max_freq=max_freq
+        )
+        axes[0].plot(kw_x[0], kw_y[0], 'g', linewidth=1.2, linestyle='-', zorder=5)
     
     # 色标
-    fig.colorbar(im1, ax=axes, orientation='horizontal', 
-                 shrink=0.6, aspect=30, pad=0.08)
-    
-    plt.tight_layout()
-    
+    spacer_ax = fig.add_subplot(gs[1, :])
+    spacer_ax.axis("off")
+    cbar_ax = fig.add_subplot(gs[2, :])
+    fig.colorbar(
+        im1,
+        cax=cbar_ax,
+        orientation='horizontal',
+    )
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches='tight')
         print(f'保存至: {save_path}')
     
-    plt.show()
+    if show:
+        _show_figure(fig)
+
+    if close:
+        plt.close(fig)
+
+    return fig, axes
 
 
 # ==================== 地图绘图 ====================

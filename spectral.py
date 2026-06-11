@@ -20,14 +20,32 @@ import xarray as xr
 import scipy.signal as signal
 from scipy import fft
 import matplotlib.pyplot as plt
+import os
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import cmaps
     DEFAULT_COLORMAP = cmaps.NCV_blu_red
 except ImportError:
     DEFAULT_COLORMAP = 'RdBu_r'
+
+
+def _show_figure(fig) -> None:
+    """Show a figure when the active backend supports it."""
+    backend = plt.get_backend().lower()
+    if "agg" not in backend or "inline" in backend:
+        plt.show()
+        return
+
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+    except ImportError:
+        return
+
+    if get_ipython() is not None:
+        display(fig)
 
 
 class SpectralConfig:
@@ -51,6 +69,15 @@ class SpectralConfig:
 
 def smooth_121(array: np.ndarray) -> np.ndarray:
     """应用1-2-1平滑滤波器"""
+    array = np.asarray(array, dtype=np.float64)
+    if array.size == 0:
+        return array
+    ok = np.isfinite(array)
+    if not np.any(ok):
+        return np.full_like(array, np.nan)
+    if not np.all(ok):
+        x = np.arange(array.size)
+        array = np.interp(x, x[ok], array[ok])
     weight = np.array([1., 2., 1.]) / 4.0
     return np.convolve(np.r_[array[0], array, array[-1]], weight, 'valid')
 
@@ -270,28 +297,33 @@ class WKSpectralAnalysis:
         sumpower = fft.fftshift(sumpower, axes=0)[nSampWin//2:, :, :]
         
         # 分离对称/反对称功率
-        self.power_symmetric = 2.0 * sumpower[:, nlat//2:, :].sum(axis=1)
-        self.power_antisymmetric = 2.0 * sumpower[:, :nlat//2, :].sum(axis=1)
-        
+        power_symmetric = np.array(
+            2.0 * sumpower[:, nlat//2:, :].sum(axis=1), copy=True
+        )
+        power_antisymmetric = np.array(
+            2.0 * sumpower[:, :nlat//2, :].sum(axis=1), copy=True
+        )
+        background = np.array(sumpower.sum(axis=1), copy=True)
+
+        # 屏蔽零频率
+        power_symmetric[0, :] = np.nan
+        power_antisymmetric[0, :] = np.nan
+        background[0, :] = np.nan
+
         # 转为DataArray
         self.power_symmetric = xr.DataArray(
-            self.power_symmetric,
+            power_symmetric,
             dims=("frequency", "wavenumber"),
             coords={"wavenumber": self.wavenumber, "frequency": self.frequency}
         )
         self.power_antisymmetric = xr.DataArray(
-            self.power_antisymmetric,
+            power_antisymmetric,
             dims=("frequency", "wavenumber"),
             coords={"wavenumber": self.wavenumber, "frequency": self.frequency}
         )
         
-        # 屏蔽零频率
-        self.power_symmetric[0, :] = np.ma.masked
-        self.power_antisymmetric[0, :] = np.ma.masked
-        
         # 背景谱
-        self.background = sumpower.sum(axis=1)
-        self.background[0, :] = np.ma.masked
+        self.background = background
         
         print(f"功率谱计算完成，耗时 {time.time() - start_time:.1f} 秒")
         return self
@@ -333,6 +365,294 @@ class WKSpectralAnalysis:
         
         print("背景谱平滑完成")
         return self
+
+    def plot_spectrum(self,
+                      max_wn: Optional[int] = None,
+                      max_freq: float = 0.5,
+                      add_matsuno_lines: bool = True,
+                      he: Optional[List[float]] = None,
+                      cpd_lines: Optional[List[float]] = None,
+                      save_path: Optional[str] = None,
+                      cmap: Optional[str] = None,
+                      levels: Optional[np.ndarray] = None,
+                      show: bool = True,
+                      close: bool = False):
+        """
+        绘制Wheeler-Kiladis归一化频谱图。
+
+        该方法封装plotting.plot_wk_spectrum，直接使用当前analysis对象中
+        已计算的对称谱、反对称谱和平滑背景谱。
+
+        参数:
+        ----
+        max_wn : int, optional
+            最大绘图波数，默认使用config.WAVENUMBER_LIMIT
+        max_freq : float
+            最大绘图频率
+        add_matsuno_lines : bool
+            是否添加Matsuno理论曲线
+        he : list of float, optional
+            Matsuno曲线的等效深度，默认[8, 25, 90]
+        cpd_lines : list of float, optional
+            标注周期线，默认[3, 6, 30]
+        save_path : str, optional
+            图像保存路径
+        cmap : str, optional
+            色标，默认使用config.COLORMAP
+        levels : np.ndarray, optional
+            等值线水平，默认使用config.CONTOUR_LEVELS
+        show : bool
+            是否调用plt.show()
+        close : bool
+            是否在绘图/保存后关闭figure，批量绘图时建议设为True
+
+        返回:
+        ----
+        fig, axes
+            Matplotlib图形和坐标轴对象
+        """
+        missing = [
+            name for name in (
+                "power_symmetric",
+                "power_antisymmetric",
+                "background",
+                "wavenumber",
+                "frequency",
+            )
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                "频谱结果尚未计算或平滑，缺少: "
+                + ", ".join(missing)
+                + "。请先运行 preprocess(), compute_spectrum(), smooth_background()."
+            )
+
+        if max_wn is None:
+            max_wn = getattr(self.config, "WAVENUMBER_LIMIT", 15)
+        if he is None:
+            he = [8, 25, 90]
+        if cpd_lines is None:
+            cpd_lines = [3, 6, 30]
+        if cmap is None:
+            cmap = getattr(self.config, "COLORMAP", DEFAULT_COLORMAP)
+        if levels is None:
+            levels = getattr(self.config, "CONTOUR_LEVELS", None)
+
+        try:
+            from .plotting import plot_wk_spectrum
+        except ImportError:
+            from plotting import plot_wk_spectrum
+
+        return plot_wk_spectrum(
+            self.power_symmetric,
+            self.power_antisymmetric,
+            self.background,
+            self.wavenumber,
+            self.frequency,
+            max_wn=max_wn,
+            max_freq=max_freq,
+            add_matsuno_lines=add_matsuno_lines,
+            he=he,
+            cpd_lines=cpd_lines,
+            save_path=save_path,
+            cmap=cmap,
+            levels=levels,
+            show=show,
+            close=close,
+        )
+
+    def _background_dataarray(self) -> xr.DataArray:
+        """返回带frequency/wavenumber坐标的背景谱。"""
+        if self.background is None or self.frequency is None or self.wavenumber is None:
+            raise ValueError("背景谱尚未计算。请先运行 compute_spectrum()。")
+
+        return xr.DataArray(
+            self.background,
+            dims=("frequency", "wavenumber"),
+            coords={"frequency": self.frequency, "wavenumber": self.wavenumber},
+        )
+
+    def _plot_power_field(self,
+                          data: xr.DataArray,
+                          ax,
+                          title: str,
+                          max_wn: int,
+                          max_freq: float,
+                          use_log: bool,
+                          cmap: str,
+                          levels):
+        """绘制单个二维功率谱场。"""
+        plot_data = data.sel(
+            frequency=slice(0.0, max_freq),
+            wavenumber=slice(-max_wn, max_wn),
+        )
+
+        if use_log:
+            plot_data = xr.where(plot_data > 0, np.log10(plot_data), np.nan)
+            cbar_label = "log10(power)"
+        else:
+            cbar_label = "power"
+
+        image = plot_data.plot.contourf(
+            ax=ax,
+            cmap=cmap,
+            levels=levels,
+            add_colorbar=False,
+            extend="both",
+        )
+        ax.axvline(0, linestyle="--", color="k", linewidth=0.5)
+        ax.set_xlim([-max_wn, max_wn])
+        ax.set_ylim([0, max_freq])
+        ax.set_title(title)
+        ax.set_xlabel("Zonal Wavenumber")
+        ax.set_ylabel("Frequency (CPD)")
+        return image, cbar_label
+
+    def plot_raw_power(self,
+                       component: str = "both",
+                       max_wn: Optional[int] = None,
+                       max_freq: float = 0.5,
+                       use_log: bool = True,
+                       cmap: str = "magma",
+                       levels=30,
+                       save_path: Optional[str] = None,
+                       show: bool = True,
+                       close: bool = False,
+                       dpi: int = 200):
+        """
+        绘制未除以背景谱的原始WK功率谱。
+
+        参数:
+        ----
+        component : {"both", "symmetric", "antisymmetric"}
+            绘制对称、反对称或两个分量
+        max_wn : int, optional
+            最大绘图波数，默认使用config.WAVENUMBER_LIMIT
+        max_freq : float
+            最大绘图频率
+        use_log : bool
+            是否绘制log10(power)
+        cmap : str
+            色标
+        levels : int or array-like
+            等值线水平
+        save_path : str, optional
+            图像保存路径
+        show : bool
+            是否调用plt.show()
+        close : bool
+            是否在绘图/保存后关闭figure，批量绘图时建议设为True
+        dpi : int
+            图像分辨率
+
+        返回:
+        ----
+        fig, axes
+            Matplotlib图形和坐标轴对象
+        """
+        if self.power_symmetric is None or self.power_antisymmetric is None:
+            raise ValueError("原始功率谱尚未计算。请先运行 compute_spectrum()。")
+
+        if max_wn is None:
+            max_wn = getattr(self.config, "WAVENUMBER_LIMIT", 15)
+
+        component = component.lower()
+        if component not in {"both", "symmetric", "antisymmetric"}:
+            raise ValueError("component must be one of: both, symmetric, antisymmetric")
+
+        if component == "both":
+            fig = plt.figure(figsize=(12, 6.2), dpi=dpi)
+            gs = fig.add_gridspec(3, 2, height_ratios=[1, 0.08, 0.1], hspace=0.1, wspace=0.25)
+            axes = np.array([
+                fig.add_subplot(gs[0, 0]),
+                fig.add_subplot(gs[0, 1]),
+            ])
+            image, cbar_label = self._plot_power_field(
+                self.power_symmetric, axes[0], "Raw Symmetric Power",
+                max_wn, max_freq, use_log, cmap, levels,
+            )
+            self._plot_power_field(
+                self.power_antisymmetric, axes[1], "Raw Antisymmetric Power",
+                max_wn, max_freq, use_log, cmap, levels,
+            )
+            spacer_ax = fig.add_subplot(gs[1, :])
+            spacer_ax.axis("off")
+            cbar_ax = fig.add_subplot(gs[2, :])
+            fig.colorbar(
+                image,
+                cax=cbar_ax,
+                orientation="horizontal",
+                label=cbar_label,
+            )
+        else:
+            fig, ax = plt.subplots(1, 1, figsize=(6.4, 6), dpi=dpi)
+            data = self.power_symmetric if component == "symmetric" else self.power_antisymmetric
+            title = "Raw Symmetric Power" if component == "symmetric" else "Raw Antisymmetric Power"
+            image, cbar_label = self._plot_power_field(
+                data, ax, title, max_wn, max_freq, use_log, cmap, levels,
+            )
+            fig.colorbar(image, ax=ax, orientation="vertical", label=cbar_label,pad = 0.05)
+            fig.subplots_adjust(right=0.88)
+            axes = ax
+
+        if save_path:
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"保存至: {save_path}")
+
+        if show:
+            _show_figure(fig)
+
+        if close:
+            plt.close(fig)
+
+        return fig, axes
+
+    def plot_background_power(self,
+                              max_wn: Optional[int] = None,
+                              max_freq: float = 0.5,
+                              use_log: bool = True,
+                              cmap: str = "magma",
+                              levels=30,
+                              save_path: Optional[str] = None,
+                              show: bool = True,
+                              close: bool = False,
+                              dpi: int = 200):
+        """
+        绘制背景功率谱。
+
+        如果已经调用 smooth_background()，这里绘制的是平滑后的背景谱；
+        如果只调用 compute_spectrum()，这里绘制的是未平滑背景谱。
+        """
+        if max_wn is None:
+            max_wn = getattr(self.config, "WAVENUMBER_LIMIT", 15)
+
+        background = self._background_dataarray()
+        fig, ax = plt.subplots(1, 1, figsize=(6.4, 5), dpi=dpi)
+        image, cbar_label = self._plot_power_field(
+            background, ax, "Background Power",
+            max_wn, max_freq, use_log, cmap, levels,
+        )
+        fig.colorbar(image, ax=ax, orientation="vertical", label=cbar_label)
+        fig.subplots_adjust(right=0.88)
+
+        if save_path:
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"保存至: {save_path}")
+
+        if show:
+            _show_figure(fig)
+
+        if close:
+            plt.close(fig)
+
+        return fig, ax
     
     def save(self, output_path: str) -> 'WKSpectralAnalysis':
         """

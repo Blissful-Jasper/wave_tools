@@ -306,7 +306,12 @@ class WaveFilter:
             )
 
         if use_parallel:
-            filtered = Parallel(n_jobs=n_jobs)(delayed(_filter_lat)(i) for i in range(len(ds.lat)))
+            # Use threads here to avoid pickling notebook-defined import state
+            # into loky workers. The heavy lifting is NumPy/SciPy-based, so
+            # threaded parallelism still works without requiring module re-imports.
+            filtered = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_filter_lat)(i) for i in range(len(ds.lat))
+            )
         else:
             filtered = [_filter_lat(i) for i in range(len(ds.lat))]
 
@@ -448,73 +453,26 @@ class WaveFilter:
 
 class CCKWFilter:
     """
-    对流耦合Kelvin波（CCKW）滤波器
-    
-    基于频率-波数空间滤波方法，使用Dask进行并行处理，可高效提取Kelvin波和ER波信号。
-    
-    参考文献：
-    - Wheeler & Kiladis (1999): https://doi.org/10.1175/1520-0469(1999)056<0374:CCEWAO>2.0.CO;2
-    - NCL kf_filter: https://www.ncl.ucar.edu/Document/Functions/User_contributed/kf_filter.shtml
-    
-    作者: xpji
-    邮箱: xianpuji@hhu.edu.cn
-    创建日期: 2025-03-03
-    最后修改: 2025-04-09
-    
-    使用示例：
-    ---------
-    >>> from wave_tools.filters import CCKWFilter
-    >>> import xarray as xr
-    >>> 
-    >>> # 读取数据
-    >>> pr_data = xr.open_dataarray('pr_data.nc')
-    >>> 
-    >>> # 初始化滤波器
-    >>> wave_filter = CCKWFilter(
-    >>>     ds=pr_data,
-    >>>     sel_dict={'time': slice('1980-01-01', '1993-12-31'), 'lat': slice(-15, 15)},
-    >>>     wave_name='kelvin',
-    >>>     units='mm/day',
-    >>>     spd=1,
-    >>>     n_workers=4
-    >>> )
-    >>> 
-    >>> # 执行滤波
-    >>> wave_filter.load_data()
-    >>> wave_filter.detrend_data()
-    >>> wave_filter.fft_transform()
-    >>> wave_filter.apply_filter()
-    >>> wave_filter.inverse_fft()
-    >>> filtered_data = wave_filter.create_output()
-    >>> 
-    >>> # 计算标准差
-    >>> std_data = filtered_data.std(dim='time')
+    对流耦合赤道波滤波器。
+
+    当前实现保持原有 API，但内部流程重构为更接近 NCL `kf_filter`：
+    1. 先计算日气候态并保留低阶年循环谐波
+    2. 在 anomaly 上逐纬度调用 NCL-aligned kf-filter
+    3. 对无法由当前采样频率可靠解析的波段直接返回零场
     """
-    
-    def __init__(self, ds=None, var=None, sel_dict=None, wave_name=None, 
-                 units=None, spd=1, n_workers=4, verbose=True):
-        """
-        初始化CCKW滤波器
-        
-        参数：
-        -----
-        ds : str, xr.Dataset, or xr.DataArray
-            输入数据，可以是文件路径、Dataset或DataArray
-        var : str, optional
-            如果ds是Dataset，需要指定变量名
-        sel_dict : dict, optional
-            数据选择字典，例如 {'time': slice('1980', '1990'), 'lat': slice(-15, 15)}
-        wave_name : str
-            波动类型，'kelvin'或'er'
-        units : str, optional
-            数据单位，用于输出
-        spd : int, default=1
-            每天的采样次数（samples per day），日数据为1，6小时数据为4
-        n_workers : int, default=4
-            Dask并行计算的工作进程数
-        verbose : bool, default=True
-            是否打印详细信息
-        """
+
+    WAVE_SPECS: Dict[str, Dict[str, Any]] = {
+        "kelvin": {"period_days": (2.5, 20.0), "wavenumber": (1, 14), "equiv_depth": (8.0, 90.0), "meridional_mode": None, "dispersion_family": "kelvin"},
+        "er": {"period_days": (9.0, 72.0), "wavenumber": (-10, -1), "equiv_depth": (8.0, 90.0), "meridional_mode": 1, "dispersion_family": "er"},
+        "ig": {"period_days": (None, None), "wavenumber": (-15, -1), "equiv_depth": (12.0, 90.0), "meridional_mode": 1, "dispersion_family": "ig"},
+        "eig0": {"period_days": (None, 1.0 / 0.55), "wavenumber": (0, 15), "equiv_depth": (12.0, 50.0), "meridional_mode": 0, "dispersion_family": "eig0_mrg"},
+        "mrg": {"period_days": (2.5, 10.0), "wavenumber": (-10, -1), "equiv_depth": (8.0, 90.0), "meridional_mode": 0, "dispersion_family": "eig0_mrg"},
+        "td": {"period_days": (2.0, 8.5), "wavenumber": (-15, -6), "equiv_depth": (None, None), "meridional_mode": None, "dispersion_family": "none"},
+        "mjo": {"period_days": (30.0, 100.0), "wavenumber": (1, 5), "equiv_depth": (None, None), "meridional_mode": None, "dispersion_family": "none"},
+    }
+
+    def __init__(self, ds=None, var=None, sel_dict=None, wave_name=None,
+                 units=None, spd=1, n_workers=4, verbose=True, n_harm=3):
         self.sel_dict = sel_dict
         self.wave_name = wave_name
         self.n_workers = n_workers
@@ -525,20 +483,22 @@ class CCKWFilter:
         self.fftdata = None
         self.var = var
         self.verbose = verbose
-        
-        # 读取数据
+        self.n_harm = n_harm
+        self.anomaly = None
+        self.filter_note = None
+        self.mask = None
+        self._resolved_spec = None
+
         if isinstance(ds, str):
             self.ds = xr.open_dataset(ds, chunks={'time': 'auto'})
         elif isinstance(ds, (xr.Dataset, xr.DataArray)):
             self.ds = ds
         else:
             raise ValueError("`ds` 必须是文件路径(str)或xarray.Dataset/DataArray")
-    
+
     def __repr__(self):
-        """字符串表示"""
         lat_sel = self.sel_dict.get('lat') if self.sel_dict and 'lat' in self.sel_dict else 'N/A'
         time_sel = self.sel_dict.get('time') if self.sel_dict and 'time' in self.sel_dict else 'N/A'
-        
         lines = [
             "📡 CCKWFilter Summary:",
             f"  • Wave Type     : {self.wave_name or 'N/A'}",
@@ -548,6 +508,7 @@ class CCKWFilter:
             f"  • Units         : {self.units or 'N/A'}",
             f"  • Workers       : {self.n_workers}",
             f"  • Sampling/day  : {self.spd}",
+            f"  • Harmonics     : {self.n_harm}",
         ]
         if self.data is not None:
             lines.append(f"  • Data Shape    : {self.data.shape}")
@@ -555,184 +516,167 @@ class CCKWFilter:
         else:
             lines.append("  • Data          : Not loaded")
         return "\n".join(lines)
-    
+
+
     def print_diagnostic_info(self, variable, name):
-        """打印变量诊断信息"""
         if not self.verbose:
             return
-            
         try:
-            import dask.array as da
             print(f"\n{'='*20} {name} Information {'='*20}")
+
             print(f"Type: {type(variable)}")
             print(f"Shape: {variable.shape}")
-            if isinstance(variable, (da.Array, np.ndarray, xr.DataArray)):
+            if hasattr(variable, 'dtype'):
                 print(f"Data type: {variable.dtype}")
-            if isinstance(variable, da.Array):
-                print(f"Chunks: {variable.chunks}")
             print(f"First few values: {variable[:5]}")
-            print("="*60)
+            print("=" * 60)
         except Exception as e:
             print(f"Error printing info for {name}: {e}")
-    
+
+    @classmethod
+    def get_wave_specs(cls) -> Dict[str, Dict[str, Any]]:
+        return {name: spec.copy() for name, spec in cls.WAVE_SPECS.items()}
+
     def load_data(self):
-        """加载和预处理数据"""
-        import dask.array as da
-        
-        # 提取数据
         if isinstance(self.ds, xr.Dataset):
             if self.var is None:
                 raise ValueError("ds是Dataset时必须指定var参数")
             self.data = self.ds[self.var].sortby('lat')
         elif isinstance(self.ds, xr.DataArray):
             self.data = self.ds.sortby('lat')
-        
-        # 应用数据选择
+
         if self.sel_dict:
             self.data = self.data.sel(**self.sel_dict)
-        
-        # 确保维度顺序和chunking
+
         self.data = self.data.sortby('lat').transpose('time', 'lat', 'lon')
-        self.data = self.data.chunk({'time': -1})
-        
         if self.verbose:
             self.print_diagnostic_info(self.data, 'Loaded Data')
-    
+
+    def _resolve_wave_spec(self) -> Dict[str, Any]:
+        if self.wave_name is None:
+            raise ValueError("必须指定 wave_name")
+        wave_key = self.wave_name.lower()
+        if wave_key not in self.WAVE_SPECS:
+            raise ValueError(f"不支持的波动类型: {self.wave_name}，支持: {list(self.WAVE_SPECS)}")
+
+        spec = self.WAVE_SPECS[wave_key]
+        self.wave_name = wave_key
+        self.tMin, self.tMax = spec["period_days"]
+        self.kmin, self.kmax = spec["wavenumber"]
+        self.hmin, self.hmax = spec["equiv_depth"]
+        self.mode_n = spec["meridional_mode"]
+        self.dispersion_family = spec["dispersion_family"]
+        self.fmin = None if self.tMax is None else 1.0 / self.tMax
+        self.fmax = None if self.tMin is None else 1.0 / self.tMin
+        self._resolved_spec = spec
+        return spec
+
+    def _backend_wave_name(self) -> str:
+        if self.wave_name == 'eig0':
+            return 'ig0'
+        return self.wave_name
+
+    def _legacy_filter(self) -> 'WaveFilter':
+        wf = WaveFilter()
+        backend_name = self._backend_wave_name()
+        wf.wave_params[backend_name] = {
+            'freq_range': (self.tMin, self.tMax),
+            'wnum_range': (self.kmin, self.kmax),
+            'equiv_depth': (
+                np.nan if self.hmin is None else self.hmin,
+                np.nan if self.hmax is None else self.hmax,
+            ),
+        }
+        return wf
+
+    def _nyquist_frequency(self) -> float:
+        return 0.5 * float(self.spd)
+
+    def _is_resolvable(self) -> bool:
+        nyquist = self._nyquist_frequency()
+        if self.fmin is not None and self.fmin >= nyquist - 1.0e-12:
+            return False
+        if self.fmax is not None and self.fmax > nyquist + 1.0e-12:
+            return False
+        return True
+
     def detrend_data(self):
-        """使用Dask进行数据去趋势处理"""
-        import dask.array as da
-        from scipy import signal
-        
-        ntim, nlat, nlon = self.data.shape
-        spd = self.spd
-        
-        data_rechunked = self.data.data.rechunk({0: -1})
-        
-        # 移除年际变化（周期>1年的信号）
-        if ntim > 365 * spd / 3:
-            rf = da.fft.rfft(data_rechunked, axis=0)
-            freq = da.fft.rfftfreq(ntim * spd, d=1. / float(spd))
-            rf[(freq <= 3. / 365) & (freq >= 1. / 365), :, :] = 0.0
-            datain = da.fft.irfft(rf, axis=0, n=ntim)
-        else:
-            datain = data_rechunked
-        
-        # 去线性趋势
-        self.detrend = da.apply_along_axis(signal.detrend, 0, datain)
-        
-        # 应用Tukey窗口减少边界效应
-        window = signal.windows.tukey(self.data.shape[0], 0.05, True)
-        self.detrend = self.detrend * window[:, np.newaxis, np.newaxis]
-    
+        self._resolve_wave_spec()
+        wf = WaveFilter()
+        clim = self.data.groupby('time.dayofyear').mean(dim='time')
+        clim_fit = wf.extract_low_harmonics(clim, n_harm=self.n_harm)
+        self.anomaly = (self.data.groupby('time.dayofyear') - clim_fit).transpose('time', 'lat', 'lon')
+        self.detrend = self.anomaly.data
+        self.filter_note = None
+        if not self._is_resolvable():
+            self.filter_note = (
+                f"Wave {self.wave_name} is not resolvable for SPD={self.spd}; "
+                "returning zeros to avoid Nyquist-edge artefacts."
+            )
+
     def fft_transform(self):
-        """执行2D FFT变换"""
-        import dask.array as da
-        
-        # 计算波数和频率
-        self.wavenumber = -da.fft.fftfreq(self.data.shape[2]) * self.data.shape[2]
-        self.frequency = da.fft.fftfreq(self.data.shape[0], d=1. / float(1))
-        
-        # 创建波数-频率网格
-        self.knum_ori, self.freq_ori = da.meshgrid(self.wavenumber, self.frequency)
+        self.wavenumber = np.fft.fftfreq(self.data.shape[2]) * self.data.shape[2]
+        self.frequency = np.fft.rfftfreq(self.data.shape[0], d=1. / float(self.spd))
+        self.knum_ori, self.freq_ori = np.meshgrid(self.wavenumber, self.frequency)
         self.knum = self.knum_ori.copy()
-        self.knum = da.where(self.freq_ori < 0, -self.knum_ori, self.knum_ori)
-        self.freq = da.abs(self.freq_ori)
-    
+        self.freq = np.abs(self.freq_ori)
+
+    def _filter_single_latitude(self, lat_idx: int) -> np.ndarray:
+        if not self._is_resolvable():
+            return np.zeros((self.anomaly.sizes['time'], self.anomaly.sizes['lon']), dtype=np.float64)
+
+        wf = self._legacy_filter()
+        backend_name = self._backend_wave_name()
+        lat_slice = self.anomaly.isel(lat=lat_idx)
+        return wf._kf_filter(
+            lat_slice.values,
+            lon=self.anomaly.lon.values,
+            obs_per_day=self.spd,
+            t_min=self.tMin,
+            t_max=self.tMax,
+            k_min=self.kmin,
+            k_max=self.kmax,
+            h_min=np.nan if self.hmin is None else self.hmin,
+            h_max=np.nan if self.hmax is None else self.hmax,
+            wave_name=backend_name,
+        )
+
     def apply_filter(self):
-        """根据波动类型应用滤波器"""
-        import dask.array as da
-        
-        # 设置波动参数
-        if self.wave_name.lower() == "kelvin":
-            self.tMin, self.tMax = 3, 20      # 周期范围（天）
-            self.kmin, self.kmax = 2, 14      # 波数范围
-            self.hmin, self.hmax = 8, 90      # 等效深度范围（米）
-        elif self.wave_name.lower() == "er":
-            self.tMin, self.tMax = 9, 72
-            self.kmin, self.kmax = -10, -1
-            self.hmin, self.hmax = 8, 90
+        if self.anomaly is None:
+            self.detrend_data()
+        self.fftdata = None
+        self.mask = None
+
+        nlat = self.anomaly.sizes['lat']
+        if self.n_workers == 1:
+            filtered = [self._filter_single_latitude(i) for i in range(nlat)]
         else:
-            raise ValueError(f"不支持的波动类型: {self.wave_name}，仅支持'kelvin'和'er'")
-        
-        self.fmin, self.fmax = 1 / self.tMax, 1 / self.tMin
-        
-        # 初始化mask
-        self.mask = da.zeros((self.data.shape[0], self.data.shape[2]), dtype=bool)
-        
-        # 应用波数和频率限制
-        if self.kmin is not None:
-            self.mask = self.mask | (self.knum < self.kmin)
-        if self.kmax is not None:
-            self.mask = self.mask | (self.kmax < self.knum)
-        if self.fmin is not None:
-            self.mask = self.mask | (self.freq < self.fmin)
-        if self.fmax is not None:
-            self.mask = self.mask | (self.fmax < self.freq)
-        
-        # 应用色散关系约束
-        self._apply_dispersion_relation()
-        
-        # 执行FFT并应用mask
-        self.fftdata = da.fft.fft2(self.detrend, axes=(0, 2))
-        self.mask = da.repeat(self.mask[:, np.newaxis, :], self.data.shape[1], axis=1)
-        self.fftdata = da.where(self.mask, 0.0, self.fftdata)
-    
+            # Avoid loky process pickling issues when this package is imported
+            # from notebooks or ad-hoc paths.
+            filtered = Parallel(n_jobs=self.n_workers, prefer="threads")(
+                delayed(self._filter_single_latitude)(i) for i in range(nlat)
+            )
+        self.filtered_data = np.stack(filtered, axis=1)
+
     def _apply_dispersion_relation(self):
-        """应用浅水波色散关系约束"""
-        import dask.array as da
-        
-        g = 9.8           # 重力加速度 (m/s²)
-        beta = 2.28e-11   # 地球自转参数 (1/m/s)
-        a = 6.37e6        # 地球半径 (m)
-        n = 1             # 经向模态数（ER波）
-        
-        if self.wave_name.lower() == "kelvin":
-            # Kelvin波色散关系: ω = ck (c = √(gh))
-            if self.hmin is not None:
-                c = da.sqrt(g * self.hmin)
-                omega = 2. * np.pi * self.freq / 24. / 3600. / da.sqrt(beta * c)
-                k = self.knum / a * da.sqrt(c / beta)
-                self.mask = self.mask | (omega - k < 0)
-            
-            if self.hmax is not None:
-                c = da.sqrt(g * self.hmax)
-                omega = 2. * np.pi * self.freq / 24. / 3600. / da.sqrt(beta * c)
-                k = self.knum / a * da.sqrt(c / beta)
-                self.mask = self.mask | (omega - k > 0)
-        
-        elif self.wave_name.lower() == "er":
-            # ER波色散关系: ω(k² + (2n+1)) + k = 0
-            if self.hmin is not None:
-                c = da.sqrt(g * self.hmin)
-                omega = 2. * np.pi * self.freq / 24. / 3600. / da.sqrt(beta * c)
-                k = self.knum / a * da.sqrt(c / beta)
-                self.mask = self.mask | (omega * (k ** 2 + (2 * n + 1)) + k < 0)
-            
-            if self.hmax is not None:
-                c = da.sqrt(g * self.hmax)
-                omega = 2. * np.pi * self.freq / 24. / 3600. / da.sqrt(beta * c)
-                k = self.knum / a * da.sqrt(c / beta)
-                self.mask = self.mask | (omega * (k ** 2 + (2 * n + 1)) + k > 0)
-    
+        return None
+
     def inverse_fft(self):
-        """执行逆FFT获取滤波后的数据"""
-        import dask.array as da
-        self.filtered_data = da.fft.ifft2(self.fftdata, axes=(0, 2)).real
-    
+        if self.filtered_data is None:
+            raise ValueError("请先执行 apply_filter()")
+        return self.filtered_data
+
     def create_output(self):
-        """创建输出的xarray DataArray"""
+        if self.filtered_data is None:
+            raise ValueError("请先执行 apply_filter()")
+
+        values = self.filtered_data.compute() if hasattr(self.filtered_data, 'compute') else np.asarray(self.filtered_data)
         self.wave_data = xr.DataArray(
-            self.filtered_data.compute(),
-            coords={
-                'time': self.data.time,
-                'lat': self.data.lat,
-                'lon': self.data.lon
-            },
+            values,
+            coords={'time': self.data.time, 'lat': self.data.lat, 'lon': self.data.lon},
             dims=['time', 'lat', 'lon']
         )
-        
-        # 添加属性信息
-        self.wave_data.attrs.update({
+        attrs = {
             'long_name': f'{self.wave_name} wave filtered data',
             'min_equiv_depth': self.hmin,
             'max_equiv_depth': self.hmax,
@@ -743,50 +687,44 @@ class CCKWFilter:
             'min_frequency': self.fmin,
             'max_frequency': self.fmax,
             'units': self.units,
-            'filter_method': 'Wheeler-Kiladis frequency-wavenumber filter',
-            'processing_date': str(np.datetime64('today'))
-        })
-        
+            'filter_method': 'NCL-aligned Wheeler-Kiladis kf_filter',
+            'processing_date': str(np.datetime64('today')),
+            'samples_per_day': self.spd,
+            'annual_cycle_harmonics': self.n_harm,
+            'backend_wave_name': self._backend_wave_name(),
+        }
+        if self.filter_note is not None:
+            attrs['note'] = self.filter_note
+        self.wave_data.attrs.update({key: value for key, value in attrs.items() if value is not None})
         return self.wave_data
-    
+
     def process(self):
-        """
-        一步执行完整的滤波流程
-        
-        返回：
-        -----
-        xr.DataArray : 滤波后的数据
-        """
         if self.verbose:
             print(f"{'='*70}")
             print(f"🌊 Processing {self.wave_name.upper()} wave filter")
             print(f"{'='*70}")
-        
+
         self.load_data()
-        
         if self.verbose:
-            print("⏳ Detrending data...")
+            print("⏳ Building anomaly field...")
         self.detrend_data()
-        
+
         if self.verbose:
-            print("⏳ Performing FFT...")
+            print("⏳ Preparing spectral coordinates...")
         self.fft_transform()
-        
+
         if self.verbose:
-            print("⏳ Applying filter...")
+            print("⏳ Applying NCL-aligned kf_filter...")
         self.apply_filter()
-        
+
         if self.verbose:
-            print("⏳ Performing inverse FFT...")
+            print("⏳ Finalizing output...")
         self.inverse_fft()
-        
-        if self.verbose:
-            print("⏳ Creating output...")
         output = self.create_output()
-        
+
         if self.verbose:
             print(f"✅ {self.wave_name.upper()} wave filtering completed!")
             print(f"{'='*70}\n")
-        
+
         return output
-        
+

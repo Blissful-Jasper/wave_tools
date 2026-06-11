@@ -448,6 +448,22 @@ def dataset_healpix_to_equatorial_latlon(
     return xr.merge(latlon_datarrays)
 
 
+
+def dataarray_to_equatorial_latlon_grid(
+    dataarray: xr.DataArray, grid_type: str, grid_dict: Optional[dict]
+) -> xr.DataArray:
+    """转换数据到赤道经纬度网格"""
+    if grid_type == "latlon":
+        return dataarray
+    elif grid_type == "healpix":
+        if grid_dict is None:
+            raise ValueError("No grid_dict provided for healpix conversion.")
+        return dataarray_healpix_to_equatorial_latlon(dataarray, **grid_dict)
+    else:
+        raise ValueError("Grid type not found.")
+
+
+
 def dataarray_healpix_to_equatorial_latlon(
     healpix_dataarray: xr.DataArray,
     nside: int,
@@ -531,19 +547,6 @@ def dataarray_healpix_to_equatorial_latlon(
         coords={"time": time, "lat": unique_lats, "lon": final_lons},
     )
     return latlon_dataarray
-
-def dataarray_to_equatorial_latlon_grid(
-    dataarray: xr.DataArray, grid_type: str, grid_dict: Optional[dict]
-) -> xr.DataArray:
-    """转换数据到赤道经纬度网格"""
-    if grid_type == "latlon":
-        return dataarray
-    elif grid_type == "healpix":
-        if grid_dict is None:
-            raise ValueError("No grid_dict provided for healpix conversion.")
-        return dataarray_healpix_to_equatorial_latlon(dataarray, **grid_dict)
-    else:
-        raise ValueError("Grid type not found.")
 
 def _process_all_lat_rings_vectorized(
     data: np.ndarray,
@@ -747,7 +750,7 @@ def dataarray_healpix_to_equatorial_latlon_fast(
     """
     if not HAS_HEALPY:
         raise ImportError("healpy is required for HEALPix operations. Install with: pip install healpy")
-    
+    MAXIMUM_LAT_RANGE = 90
     if minmax_lat > MAXIMUM_LAT_RANGE:
         raise ValueError(f"minmax_lat={minmax_lat} too wide for equatorial analysis.")
     
@@ -830,6 +833,437 @@ def get_region_healpix_(zoom: int = 8, extent: list = [-180, 181, -16, 16], nest
     print(f"网格数量 Pixels: {len(icell)}")
 
     return icell
+
+
+def _is_valid_healpix_layout(npix: int) -> bool:
+    """Return True when pixel count matches a valid HEALPix nside."""
+    if npix <= 0 or npix % 12 != 0:
+        return False
+    nside_sq = npix // 12
+    nside = int(np.sqrt(nside_sq))
+    return nside > 0 and nside * nside == nside_sq and (nside & (nside - 1) == 0)
+
+
+def _regular_centers_to_edges(centers: np.ndarray) -> np.ndarray:
+    """Build cell edges from a regular 1D center grid."""
+    centers = np.asarray(centers, dtype=float)
+    if centers.ndim != 1 or centers.size < 2:
+        raise ValueError("target centers must be a 1D array with at least 2 points")
+    delta = np.diff(centers)
+    if not np.allclose(delta, delta[0]):
+        raise ValueError("target centers must be regularly spaced")
+
+    edges = np.empty(centers.size + 1, dtype=float)
+    edges[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+    edges[0] = centers[0] - 0.5 * delta[0]
+    edges[-1] = centers[-1] + 0.5 * delta[-1]
+    return edges
+
+
+def _resolve_icon_grid_file(data: xr.DataArray) -> str:
+    """Locate the ICON grid file stored alongside the source data file."""
+    source = data.encoding.get("source")
+    if not source:
+        raise FileNotFoundError(
+            "Cannot resolve ICON grid file because the DataArray has no source path in encoding."
+        )
+
+    source_dir = os.path.dirname(os.path.realpath(source))
+    candidates = [
+        os.path.join(source_dir, name)
+        for name in sorted(os.listdir(source_dir))
+        if name.startswith("icon_grid_") and name.endswith("_G.nc")
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No local ICON grid file found next to source data: {source_dir}"
+        )
+    return candidates[0]
+
+
+def dataarray_icon_unstructured_to_latlon_grid(
+    data: xr.DataArray,
+    grid_file: Optional[str] = None,
+    minmax_lat: float = 36.0,
+    target_lat: Optional[np.ndarray] = None,
+    target_lon: Optional[np.ndarray] = None,
+    area_weighted: bool = True,
+) -> xr.DataArray:
+    """
+    Convert ICON unstructured data to a regular lat-lon grid using cell-center bin averaging.
+
+    This method is robust for very high-resolution ICON meshes where HEALPix-based logic
+    is not applicable. Each ICON cell is assigned to a target lat-lon bin using its center
+    coordinates, and values are averaged with cell-area weights when available.
+    """
+    if target_lat is None:
+        target_lat = np.arange(-minmax_lat, minmax_lat + 0.1, 2.0)
+    if target_lon is None:
+        target_lon = np.arange(0.0, 360.0, 2.0)
+
+    target_lat = np.asarray(target_lat, dtype=float)
+    target_lon = np.asarray(target_lon, dtype=float)
+
+    grid_file = grid_file or _resolve_icon_grid_file(data)
+    with xr.open_dataset(grid_file) as grid_ds:
+        cell_lon = np.rad2deg(grid_ds["clon"].values) % 360.0
+        cell_lat = np.rad2deg(grid_ds["clat"].values)
+        if area_weighted and "cell_area" in grid_ds.variables:
+            cell_area = grid_ds["cell_area"].values
+        else:
+            cell_area = np.ones_like(cell_lon, dtype=np.float64)
+
+    cell_dim = None
+    for dim in data.dims:
+        if data.sizes[dim] == cell_lon.size:
+            cell_dim = dim
+            break
+    if cell_dim is None:
+        raise ValueError(
+            "Could not identify ICON cell dimension for unstructured-grid conversion."
+        )
+
+    time_dim = "time" if "time" in data.dims else None
+    if time_dim is not None:
+        working = data.transpose(time_dim, cell_dim)
+        values = np.asarray(working.values)
+        time_coord = working[time_dim].values
+    else:
+        working = data.transpose(cell_dim)
+        values = np.asarray(working.values)[np.newaxis, :]
+        time_coord = None
+
+    lat_edges = _regular_centers_to_edges(target_lat)
+    lon_edges = _regular_centers_to_edges(target_lon)
+    dlon = float(np.diff(target_lon)[0])
+    lon_start = float(lon_edges[0])
+
+    lat_idx = np.searchsorted(lat_edges, cell_lat, side="right") - 1
+    lon_idx = np.floor(((cell_lon - lon_start) % 360.0) / dlon).astype(np.int64)
+    lon_idx = np.clip(lon_idx, 0, target_lon.size - 1)
+
+    valid = (
+        (lat_idx >= 0)
+        & (lat_idx < target_lat.size)
+        & (cell_lat >= lat_edges[0])
+        & (cell_lat <= lat_edges[-1])
+    )
+    flat_bin = lat_idx[valid].astype(np.int64) * target_lon.size + lon_idx[valid]
+    weights = cell_area[valid].astype(np.float64)
+
+    ntime = values.shape[0]
+    ngrid = target_lat.size * target_lon.size
+    output = np.full((ntime, target_lat.size, target_lon.size), np.nan, dtype=np.float64)
+
+    for it in range(ntime):
+        vals = np.asarray(values[it, valid], dtype=np.float64)
+        finite = np.isfinite(vals)
+        if not np.any(finite):
+            continue
+
+        w = weights[finite]
+        b = flat_bin[finite]
+        weighted_sum = np.bincount(b, weights=vals[finite] * w, minlength=ngrid)
+        weight_sum = np.bincount(b, weights=w, minlength=ngrid)
+
+        row = np.full(ngrid, np.nan, dtype=np.float64)
+        good = weight_sum > 0.0
+        row[good] = weighted_sum[good] / weight_sum[good]
+        output[it] = row.reshape(target_lat.size, target_lon.size)
+
+    coords = {"lat": target_lat, "lon": target_lon}
+    dims = ["lat", "lon"]
+    if time_coord is not None:
+        coords["time"] = time_coord
+        dims = ["time", "lat", "lon"]
+
+    result = xr.DataArray(
+        output if time_coord is not None else output[0],
+        dims=dims,
+        coords=coords,
+        name=data.name,
+        attrs=dict(data.attrs),
+    )
+    result.attrs["grid_mapping"] = "icon_unstructured_cell_center_binning"
+    result.attrs["icon_grid_file"] = grid_file
+    result.attrs["area_weighted"] = "true" if area_weighted else "false"
+    return result
+
+
+def convert_icon_to_latlon_grid(
+    data: xr.DataArray,
+    nside: int = 256,
+    nest: bool = True,
+    minmax_lat: float = 36.0,
+    target_lat: Optional[np.ndarray] = None,
+    target_lon: Optional[np.ndarray] = None,
+    interp_method: str = 'linear'
+) -> xr.DataArray:
+    """
+    将ICON HEALPix网格数据转换为经纬度网格，并可选插值到目标分辨率
+    
+    此函数整合了HEALPix到等距柱状投影的转换和插值两个步骤，
+    适用于ICON模式输出数据的标准化处理流程。
+    
+    Parameters 参数
+    ----------
+    data : xr.DataArray
+        ICON HEALPix网格数据，维度为 (time, cell) 或 (cell,)
+        ICON HEALPix grid data with dimensions (time, cell) or (cell,)
+    nside : int, optional
+        HEALPix分辨率参数，默认256 (对应R2B8)
+        HEALPix resolution parameter, default 256 (for R2B8)
+    nest : bool, optional
+        是否使用嵌套排列，默认True
+        Whether to use nested ordering, default True
+    minmax_lat : float, optional
+        赤道带纬度范围 (±minmax_lat)，默认36度
+        Equatorial band latitude range (±minmax_lat), default 36 degrees
+    target_lat : np.ndarray, optional
+        目标纬度网格，如 np.arange(-36, 36.1, 2.0)
+        Target latitude grid, e.g., np.arange(-36, 36.1, 2.0)
+        如果为None，则不进行插值
+        If None, no interpolation is performed
+    target_lon : np.ndarray, optional
+        目标经度网格，如 np.arange(0, 360, 2.0)
+        Target longitude grid, e.g., np.arange(0, 360, 2.0)
+        如果为None，则不进行插值
+        If None, no interpolation is performed
+    interp_method : str, optional
+        插值方法，可选 'linear' 或 'nearest'，默认'linear'
+        Interpolation method, 'linear' or 'nearest', default 'linear'
+    
+    Returns 返回
+    -------
+    xr.DataArray
+        经纬度网格数据，维度为 (time, lat, lon) 或 (lat, lon)
+        Lat-lon grid data with dimensions (time, lat, lon) or (lat, lon)
+    
+    Examples 示例
+    --------
+    >>> # 基本转换（无插值）
+    >>> pr_latlon = convert_icon_to_latlon_grid(pr_icon, nside=256, nest=True)
+    
+    >>> # 转换并插值到2度网格
+    >>> target_lat = np.arange(-36, 36.1, 2.0)
+    >>> target_lon = np.arange(0, 360, 2.0)
+    >>> pr_2deg = convert_icon_to_latlon_grid(
+    ...     pr_icon, 
+    ...     target_lat=target_lat, 
+    ...     target_lon=target_lon
+    ... )
+    
+    Notes 注意事项
+    -----
+    - 此函数依赖 healpy 库
+    - 处理大数据集时建议分批处理时间维度
+    - 插值方法 'linear' 更平滑但计算较慢，'nearest' 更快但可能有阶梯效应
+    - This function requires the healpy library
+    - For large datasets, consider processing time dimension in batches
+    - 'linear' interpolation is smoother but slower, 'nearest' is faster but may show stepping
+    """
+    grid_type = str(data.attrs.get("CDI_grid_type", "")).lower()
+    cell_like_dims = [dim for dim in data.dims if dim in {"cell", "ncells"}]
+    looks_like_healpix = any(_is_valid_healpix_layout(data.sizes[dim]) for dim in cell_like_dims)
+
+    inferred_nside = None
+    for dim in cell_like_dims:
+        dim_size = data.sizes[dim]
+        if _is_valid_healpix_layout(dim_size):
+            inferred_nside = int(np.sqrt(dim_size // 12))
+            break
+
+    if (grid_type == "unstructured" and not looks_like_healpix) or (cell_like_dims and not looks_like_healpix):
+        print("\n" + "="*70)
+        print("🌐 ICON unstructured grid → 经纬度网格转换")
+        print("="*70)
+        print("📍 方法: 基于真实 ICON cell center 的面积加权格点平均")
+        print(f"   • 纬度范围: ±{minmax_lat}°")
+        if target_lat is not None and target_lon is not None:
+            print(f"   • 目标纬度点数: {len(target_lat)}")
+            print(f"   • 目标经度点数: {len(target_lon)}")
+
+        data_latlon = dataarray_icon_unstructured_to_latlon_grid(
+            data=data,
+            minmax_lat=minmax_lat,
+            target_lat=target_lat,
+            target_lon=target_lon,
+            area_weighted=True,
+        )
+        print(f"   ✅ 转换完成")
+        print(f"   • 输出维度: {list(data_latlon.dims)}")
+        print(f"   • 输出形状: {data_latlon.shape}")
+        print("="*70 + "\n")
+        return data_latlon
+
+    if not HAS_HEALPY:
+        raise ImportError("healpy is required. Install with: pip install healpy")
+
+    if inferred_nside is not None and inferred_nside != nside:
+        print(f"   • 自动识别 HEALPix nside: {inferred_nside} (覆盖传入的 nside={nside})")
+        nside = inferred_nside
+    
+    print("\n" + "="*70)
+    print("🌐 ICON HEALPix → 经纬度网格转换")
+    print("="*70)
+    
+    # Step 1: HEALPix到等距柱状投影转换
+    print(f"📍 步骤1: HEALPix → 等距柱状投影")
+    print(f"   • nside: {nside}")
+    print(f"   • nest: {nest}")
+    print(f"   • 纬度范围: ±{minmax_lat}°")
+    
+    grid_dict = {
+        "nside": nside,
+        "nest": nest,
+        "minmax_lat": minmax_lat
+    }
+    
+    data_latlon = dataarray_healpix_to_equatorial_latlon(data, **grid_dict)
+    
+    print(f"   ✅ 转换完成")
+    print(f"   • 输出维度: {list(data_latlon.dims)}")
+    print(f"   • 输出形状: {data_latlon.shape}")
+    print(f"   • 纬度范围: {data_latlon.lat.values.min():.2f}° 至 {data_latlon.lat.values.max():.2f}°")
+    print(f"   • 经度范围: {data_latlon.lon.values.min():.2f}° 至 {data_latlon.lon.values.max():.2f}°")
+    
+    # Step 2: 插值到目标网格（可选）
+    if target_lat is not None and target_lon is not None:
+        print(f"\n📍 步骤2: 插值到目标网格")
+        print(f"   • 目标纬度: {len(target_lat)} 点 ({target_lat.min():.1f}° - {target_lat.max():.1f}°)")
+        print(f"   • 目标经度: {len(target_lon)} 点 ({target_lon.min():.1f}° - {target_lon.max():.1f}°)")
+        print(f"   • 插值方法: {interp_method}")
+        
+        data_interp = data_latlon.interp(
+            lat=target_lat,
+            lon=target_lon,
+            method=interp_method
+        )
+        
+        print(f"   ✅ 插值完成")
+        print(f"   • 输出形状: {data_interp.shape}")
+        
+        print("="*70 + "\n")
+        return data_interp
+    else:
+        print(f"\n⏭️  跳过插值步骤")
+        print("="*70 + "\n")
+        return data_latlon
+
+
+def batch_convert_icon_to_latlon(
+    data_dict: dict,
+    output_dir: str,
+    nside: int = 256,
+    nest: bool = True,
+    minmax_lat: float = 36.0,
+    target_lat: Optional[np.ndarray] = None,
+    target_lon: Optional[np.ndarray] = None,
+    interp_method: str = 'linear',
+    skip_existing: bool = True
+) -> dict:
+    """
+    批量转换多个实验的ICON数据到经纬度网格
+    
+    Parameters 参数
+    ----------
+    data_dict : dict
+        实验数据字典，格式: {'exp_name': xr.DataArray}
+        Dictionary of experiment data, format: {'exp_name': xr.DataArray}
+    output_dir : str
+        输出目录路径
+        Output directory path
+    nside, nest, minmax_lat, target_lat, target_lon, interp_method :
+        同 convert_icon_to_latlon_grid 参数
+        Same as convert_icon_to_latlon_grid parameters
+    skip_existing : bool, optional
+        是否跳过已存在的文件，默认True
+        Whether to skip existing files, default True
+    
+    Returns 返回
+    -------
+    dict
+        转换后的数据字典，格式同输入
+        Dictionary of converted data, same format as input
+    
+    Examples 示例
+    --------
+    >>> data_dict = {
+    ...     'control': pr_control,
+    ...     'plus2K': pr_plus2K,
+    ...     'plus4K': pr_plus4K
+    ... }
+    >>> results = batch_convert_icon_to_latlon(
+    ...     data_dict,
+    ...     output_dir='/path/to/output',
+    ...     target_lat=np.arange(-36, 36.1, 2.0),
+    ...     target_lon=np.arange(0, 360, 2.0)
+    ... )
+    """
+    import os
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    results = {}
+    n_exp = len(data_dict)
+    
+    print("\n" + "🌍"*35)
+    print(f"📊 批量转换 {n_exp} 个实验的数据")
+    print("🌍"*35 + "\n")
+    
+    for idx, (exp_name, data) in enumerate(data_dict.items(), 1):
+        print(f"\n{'='*70}")
+        print(f"[{idx}/{n_exp}] 实验: {exp_name.upper()}")
+        print(f"{'='*70}")
+        
+        # 构建输出文件路径
+        if target_lat is not None and target_lon is not None:
+            resolution = abs(target_lat[1] - target_lat[0])
+            output_file = os.path.join(
+                output_dir, 
+                f"{exp_name}_latlon_{resolution:.0f}deg.nc"
+            )
+        else:
+            output_file = os.path.join(output_dir, f"{exp_name}_latlon.nc")
+        
+        # 检查是否已存在
+        if skip_existing and os.path.exists(output_file):
+            print(f"✅ 文件已存在，跳过: {output_file}")
+            results[exp_name] = xr.open_dataarray(output_file)
+            continue
+        
+        try:
+            # 转换数据
+            data_converted = convert_icon_to_latlon_grid(
+                data,
+                nside=nside,
+                nest=nest,
+                minmax_lat=minmax_lat,
+                target_lat=target_lat,
+                target_lon=target_lon,
+                interp_method=interp_method
+            )
+            
+            # 保存文件
+            print(f"💾 保存到: {output_file}")
+            data_converted.to_netcdf(output_file)
+            print(f"✅ 保存完成")
+            
+            results[exp_name] = data_converted
+            
+        except Exception as e:
+            print(f"❌ 处理失败: {exp_name}")
+            print(f"   错误信息: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            results[exp_name] = None
+    
+    print("\n" + "🌍"*35)
+    print("✅ 批量转换完成！")
+    print("🌍"*35 + "\n")
+    
+    return results
+
 
 
 
