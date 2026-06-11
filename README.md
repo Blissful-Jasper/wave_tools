@@ -140,6 +140,16 @@ fig, axes = plot_wk_spectrum(
 
 核心依赖包括 `numpy`、`xarray`、`scipy`、`matplotlib`、`pandas`、`cartopy`、`numba`、`joblib`、`scikit-image` 和 `healpy`。部分诊断函数还会用到 `metpy` 和 `geocat-comp`。
 
+## 致谢
+
+Wave Tools 的部分实现参考、整合并调整了以下公开代码和项目。感谢原作者公开这些工作；原项目的版权和许可条款仍归各自项目所有。
+
+- [mmaiergerber/wk_spectra](https://github.com/mmaiergerber/wk_spectra)
+- brianpm: [wavenumber_frequency_functions.py](https://github.com/Blissful-Jasper/wavenumber_frequency/blob/master/wavenumber_frequency_functions.py)
+- Alejandro Jaramillo: [wk_analysis.py](https://github.com/Blissful-Jasper/wk_spectra/blob/master/wk_spectra/wk_analysis.py)
+- tmiyachi: [spectrum.py](https://github.com/Blissful-Jasper/mcclimate/blob/master/spectrum.py)
+- muting-chien: [CCKW_aquaplanet/function](https://github.com/muting-chien/CCKW_aquaplanet/tree/ef3a5ea0f1166a831aa69b6834db3f52e0aa0c19/function)
+
 ## 引用
 
 如果在论文或报告中使用本工具包，建议同时引用具体使用的方法文献，例如：

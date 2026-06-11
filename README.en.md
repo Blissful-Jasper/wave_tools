@@ -138,6 +138,16 @@ Filtering and spectral routines generally assume regular temporal sampling. In `
 
 Core dependencies include `numpy`, `xarray`, `scipy`, `matplotlib`, `pandas`, `cartopy`, `numba`, `joblib`, `scikit-image`, and `healpy`. Some diagnostic routines also use `metpy` and `geocat-comp`.
 
+## Acknowledgements
+
+Parts of Wave Tools were integrated, adapted, and modified from the following public codebases. We thank the original authors for making their work available; copyrights and license terms remain with the respective upstream projects.
+
+- [mmaiergerber/wk_spectra](https://github.com/mmaiergerber/wk_spectra)
+- brianpm: [wavenumber_frequency_functions.py](https://github.com/Blissful-Jasper/wavenumber_frequency/blob/master/wavenumber_frequency_functions.py)
+- Alejandro Jaramillo: [wk_analysis.py](https://github.com/Blissful-Jasper/wk_spectra/blob/master/wk_spectra/wk_analysis.py)
+- tmiyachi: [spectrum.py](https://github.com/Blissful-Jasper/mcclimate/blob/master/spectrum.py)
+- muting-chien: [CCKW_aquaplanet/function](https://github.com/muting-chien/CCKW_aquaplanet/tree/ef3a5ea0f1166a831aa69b6834db3f52e0aa0c19/function)
+
 ## Citation
 
 If this package is used in a paper or report, please cite the relevant method papers as appropriate, for example:
